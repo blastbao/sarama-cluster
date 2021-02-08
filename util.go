@@ -49,6 +49,9 @@ func (p int32Slice) Diff(o int32Slice) (res []int32) {
 
 // --------------------------------------------------------------------
 
+
+
+
 type loopTomb struct {
 	c chan none
 	o sync.Once
@@ -59,17 +62,31 @@ func newLoopTomb() *loopTomb {
 	return &loopTomb{c: make(chan none)}
 }
 
-func (t *loopTomb) stop()  { t.o.Do(func() { close(t.c) }) }
-func (t *loopTomb) Close() { t.stop(); t.w.Wait() }
+func (t *loopTomb) stop()  {
+	t.o.Do(
+		func() {
+			close(t.c)
+		},
+	)
+}
 
-func (t *loopTomb) Dying() <-chan none { return t.c }
+func (t *loopTomb) Close() {
+	t.stop()
+	t.w.Wait()
+}
+
+func (t *loopTomb) Dying() <-chan none {
+	return t.c
+}
+
 func (t *loopTomb) Go(f func(<-chan none)) {
+
 	t.w.Add(1)
 
 	go func() {
 		defer t.stop()
 		defer t.w.Done()
-
+		//
 		f(t.c)
 	}()
 }

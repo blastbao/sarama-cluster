@@ -32,18 +32,24 @@ const (
 
 // Notification are state events emitted by the consumers on rebalance
 type Notification struct {
+
 	// Type exposes the notification type
+	// 通知类型
 	Type NotificationType
 
 	// Claimed contains topic/partitions that were claimed by this rebalance cycle
+	// Claimed 包含这个 rebalance 周期中涉及的 topic/partitions
 	Claimed map[string][]int32
 
 	// Released contains topic/partitions that were released as part of this rebalance cycle
+	// Released 包含 topic/partitions
 	Released map[string][]int32
 
 	// Current are topic/partitions that are currently claimed to the consumer
 	Current map[string][]int32
 }
+
+
 
 func newNotification(current map[string][]int32) *Notification {
 	return &Notification{
@@ -53,46 +59,59 @@ func newNotification(current map[string][]int32) *Notification {
 }
 
 func (n *Notification) success(current map[string][]int32) *Notification {
+
 	o := &Notification{
 		Type:     RebalanceOK,
 		Claimed:  make(map[string][]int32),
 		Released: make(map[string][]int32),
 		Current:  current,
 	}
+
 	for topic, partitions := range current {
 		o.Claimed[topic] = int32Slice(partitions).Diff(int32Slice(n.Current[topic]))
 	}
+
 	for topic, partitions := range n.Current {
 		o.Released[topic] = int32Slice(partitions).Diff(int32Slice(current[topic]))
 	}
+
 	return o
 }
 
 func (n *Notification) error() *Notification {
+
 	o := &Notification{
 		Type:     RebalanceError,
 		Claimed:  make(map[string][]int32),
 		Released: make(map[string][]int32),
 		Current:  make(map[string][]int32),
 	}
+
 	for topic, partitions := range n.Claimed {
 		o.Claimed[topic] = append(make([]int32, 0, len(partitions)), partitions...)
 	}
+
 	for topic, partitions := range n.Released {
 		o.Released[topic] = append(make([]int32, 0, len(partitions)), partitions...)
 	}
+
 	for topic, partitions := range n.Current {
 		o.Current[topic] = append(make([]int32, 0, len(partitions)), partitions...)
 	}
+
 	return o
 }
 
 // --------------------------------------------------------------------
 
+
+
+
 type topicInfo struct {
 	Partitions []int32
 	MemberIDs  []string
 }
+
 
 func (info topicInfo) Perform(s Strategy) map[string][]int32 {
 	if s == StrategyRoundRobin {
@@ -100,6 +119,7 @@ func (info topicInfo) Perform(s Strategy) map[string][]int32 {
 	}
 	return info.Ranges()
 }
+
 
 func (info topicInfo) Ranges() map[string][]int32 {
 	sort.Strings(info.MemberIDs)
@@ -120,6 +140,7 @@ func (info topicInfo) Ranges() map[string][]int32 {
 	return res
 }
 
+
 func (info topicInfo) RoundRobin() map[string][]int32 {
 	sort.Strings(info.MemberIDs)
 
@@ -132,6 +153,7 @@ func (info topicInfo) RoundRobin() map[string][]int32 {
 	return res
 }
 
+
 // --------------------------------------------------------------------
 
 type balancer struct {
@@ -140,8 +162,11 @@ type balancer struct {
 	strategy Strategy
 }
 
+
 func newBalancerFromMeta(client sarama.Client, strategy Strategy, members map[string]sarama.ConsumerGroupMemberMetadata) (*balancer, error) {
+
 	balancer := newBalancer(client, strategy)
+
 	for memberID, meta := range members {
 		for _, topic := range meta.Topics {
 			if err := balancer.Topic(topic, memberID); err != nil {
@@ -149,8 +174,11 @@ func newBalancerFromMeta(client sarama.Client, strategy Strategy, members map[st
 			}
 		}
 	}
+
 	return balancer, nil
 }
+
+
 
 func newBalancer(client sarama.Client, strategy Strategy) *balancer {
 	return &balancer{
@@ -163,6 +191,7 @@ func newBalancer(client sarama.Client, strategy Strategy) *balancer {
 func (r *balancer) Topic(name string, memberID string) error {
 	topic, ok := r.topics[name]
 	if !ok {
+		// 根据 topic 查询 partition id 列表
 		nums, err := r.client.Partitions(name)
 		if err != nil {
 			return err
@@ -172,7 +201,9 @@ func (r *balancer) Topic(name string, memberID string) error {
 			MemberIDs:  make([]string, 0, 1),
 		}
 	}
+	// 把 memberId 保存到 topic 成员中
 	topic.MemberIDs = append(topic.MemberIDs, memberID)
+	// 更新 topic 下配置
 	r.topics[name] = topic
 	return nil
 }

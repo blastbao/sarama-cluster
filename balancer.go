@@ -198,7 +198,7 @@ func newBalancer(client sarama.Client, strategy Strategy) *balancer {
 	}
 }
 
-// 把 memberId 添加到 Topic 的订阅成员列表中
+// 把 member 添加到 Topic 的订阅成员列表中
 func (r *balancer) Topic(name string, memberID string) error {
 	topic, ok := r.topics[name]
 	if !ok {
@@ -220,7 +220,7 @@ func (r *balancer) Topic(name string, memberID string) error {
 }
 
 
-// 返回 map[memberID][topic]partitions ，即每个 memberId 在 topic 下订阅的 partitions 列表。
+// 返回 map[memberID][topic]partitions ，即组内每个 member 在 topic 下订阅的 partitions 列表。
 func (r *balancer) Perform() map[string]map[string][]int32 {
 
 	res := make(map[string]map[string][]int32, 1)

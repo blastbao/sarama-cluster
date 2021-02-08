@@ -30,7 +30,7 @@ type Consumer struct {
 	dying, dead chan none
 	closeOnce   sync.Once
 
-	consuming     int32
+	consuming     int32		// 0: 未在消费中, 1: 正在消费中
 	messages      chan *sarama.ConsumerMessage
 	errors        chan error
 	partitions    chan PartitionConsumer
@@ -112,7 +112,7 @@ func NewConsumerFromClient(client *Client, groupID string, topics []string) (*Co
 		return nil, err
 	}
 
-	go c.mainLoop() // 其中以 map[topic][partition] 并发 createConsumer
+	go c.mainLoop()
 	return c, nil
 }
 
@@ -341,9 +341,12 @@ func (c *Consumer) CommitOffsets() error {
 // Close safely closes the consumer and releases all resources
 func (c *Consumer) Close() (err error) {
 	c.closeOnce.Do(func() {
-		close(c.dying)
-		<-c.dead
 
+
+		// 触发关闭，收到此信号后，所有后台协程均会退出
+		close(c.dying)
+		// 当 mainLoop 主协程最后退出时，会执行 close(closeCh.dead)，触发本处返回
+		<-c.dead
 
 		// 停止所有 consumers 并提交偏移量
 		if e := c.release(); e != nil {
@@ -393,14 +396,16 @@ func (c *Consumer) Close() (err error) {
 	return
 }
 
+// mainLoop 是个无限循环，仅能通过 Consumer.Close() 中 close(closeCh.dying) 来主动结束。
+// 在 mainLoop 退出前，会 close(closeCh.dead) 从而触发 Consumer.Close() 结束阻塞式等待并返回。
 func (c *Consumer) mainLoop() {
 
 	defer close(c.dead)
-	defer atomic.StoreInt32(&c.consuming, 0)
+	defer atomic.StoreInt32(&c.consuming, 0) // mainLoop() 退出后重置为 0 ，表明当前未消费
 
 	for {
 
-		//
+		// 设置当前状态为 `未在消费中`
 		atomic.StoreInt32(&c.consuming, 0)
 
 		// Check if close was requested
@@ -411,6 +416,8 @@ func (c *Consumer) mainLoop() {
 		}
 
 		// Start next consume cycle
+		//
+		// nextTick() 是阻塞式的，如果过程中出错导致退出，for 会再次启动它，重新进行初始化和消息消费
 		c.nextTick()
 	}
 }
@@ -418,31 +425,40 @@ func (c *Consumer) mainLoop() {
 func (c *Consumer) nextTick() {
 
 	// Remember previous subscriptions
+	//
+	// 如果开启了通知机制，就创建一个 Notification 对象，其保存此前的订阅关系
 	var notification *Notification
-	if c.client.config.Group.Return.Notifications { // 如果开启了通知机制，就创建一个 Notification 对象
+	if c.client.config.Group.Return.Notifications {
 		notification = newNotification(c.subs.Info())
 	}
 
 	// Refresh coordinator
+	//
+	// 刷新 coordinator
 	if err := c.refreshCoordinator(); err != nil {
 		c.rebalanceError(err, nil)
 		return
 	}
 
-
 	// Release subscriptions
+	//
+	// 停止所有 consumers 并提交偏移量
 	if err := c.release(); err != nil {
 		c.rebalanceError(err, nil)
 		return
 	}
 
-
 	// Issue rebalance start notification
+	//
+	// 开始 rebalance 前，发送 Notification ，把 rebalance 前的订阅列表发送出去
 	if c.client.config.Group.Return.Notifications {
 		c.handleNotification(newNotification(c.subs.Info()))
 	}
 
+
 	// Rebalance, fetch new subscriptions
+	//
+	// 执行 rebalance 得到新的订阅列表 sub = map[topic][partitions...]
 	subs, err := c.rebalance()
 	if err != nil {
 		c.rebalanceError(err, notification)
@@ -451,14 +467,17 @@ func (c *Consumer) nextTick() {
 
 	// Coordinate loops, make sure everything is stopped on exit
 	tomb := newLoopTomb()
-	defer tomb.Close()
-
+	defer tomb.Close() // tomb.Close() 会等待所有后台协程退出，当其返回代表 hbLoop、twLoop、cmLoop 协程均已退出。
 
 	// Start the heartbeat
+	//
+	// 启动心跳协程
 	tomb.Go(c.hbLoop)
 
 
 	// Subscribe to topic/partitions
+	//
+	// 用最新分配的订阅类别，创建对应的一组 PartitionConsumers ，并启动消费
 	if err := c.subscribe(tomb, subs); err != nil {
 		c.rebalanceError(err, notification)
 		return
@@ -466,6 +485,8 @@ func (c *Consumer) nextTick() {
 
 
 	// Update/issue notification with new claims
+	//
+	// 完成 rebalance 后，发送 Notification ，把 rebalance 后的最新订阅列表发送出去
 	if c.client.config.Group.Return.Notifications {
 		notification = notification.success(subs)
 		c.handleNotification(notification)
@@ -473,18 +494,26 @@ func (c *Consumer) nextTick() {
 
 
 	// Start topic watcher loop
+	//
+	// 启动定时刷新 topic 协程
 	tomb.Go(c.twLoop)
 
-
 	// Start consuming and committing offsets
+	//
+	// 启动定时提交 Offset 协程
 	tomb.Go(c.cmLoop)
+
+
+	// 设置 closeCh.consuming 为 1 ，表明正在消费中
 	atomic.StoreInt32(&c.consuming, 1)
 
 
 	// Wait for signals
+	//
+	// 等待退出信号
 	select {
-	case <-tomb.Dying():
-	case <-c.dying:
+	case <-tomb.Dying(): 	// tomb.Dying() 返回监听管道，如果有任一后台协程退出，或者有主动的 tomb.Close() 操作，该管道会被触发。
+	case <-c.dying:			// 等待 Consumer.Close() 关闭通知
 	}
 }
 
@@ -593,7 +622,7 @@ func (c *Consumer) rebalanceError(err error, n *Notification) {
 	}
 }
 
-// 如果开启了通知，就把 n 写入 c.notifications 管道中。
+// 如果开启了通知，就把 n 写入 closeCh.notifications 管道中。
 func (c *Consumer) handleNotification(n *Notification) {
 	if c.client.config.Group.Return.Notifications {
 		select {
@@ -604,7 +633,7 @@ func (c *Consumer) handleNotification(n *Notification) {
 	}
 }
 
-// 如果开启了错误，就把 e 写入 c.errors 管道中。
+// 如果开启了错误，就把 e 写入 closeCh.errors 管道中。
 func (c *Consumer) handleError(e *Error) {
 	if c.client.config.Consumer.Return.Errors {
 		select {
@@ -622,11 +651,11 @@ func (c *Consumer) handleError(e *Error) {
 func (c *Consumer) release() (err error) {
 
 	// Stop all consumers
-	// 停止所有正在消费的 consumers
+	// 停止所有正在消费的 partitionConsumers
 	c.subs.Stop()
 
 	// Clear subscriptions on exit
-	// 在函数退出前，清空保存的 consumers 订阅信息
+	// 在函数退出前，清空保存的 partitionConsumers 订阅信息
 	defer c.subs.Clear()
 
 	// Wait for messages to be processed
@@ -637,7 +666,7 @@ func (c *Consumer) release() (err error) {
 	// ???
 	select {
 	case <-c.dying:
-	case <-timeout.C:
+	case <-timeout.C:	// 等待消息处理完
 	}
 
 	// Commit offsets, continue on errors
@@ -682,12 +711,26 @@ func (c *Consumer) heartbeat() error {
 // Performs a rebalance, part of the mainLoop()
 //
 // 执行 rebalance
+//
+//
+//
+//
+// rebalance 本质上是一组协议，目前 kafka 提供 5 个协议来处理与 consumer group coordination 相关问题：
+//
+//	Heartbeat 请求：成员定期上报心跳到 coordinator 来表明自己还活着
+//	LeaveGroup 请求：成员主动通知 coordinator 我要离开 group
+//	SyncGroup 请求：group leader 把分配方案告诉组内所有成员
+//	JoinGroup 请求：成员请求加入组
+//	DescribeGroup 请求：显示组的所有信息，包括成员信息、协议名称、分配方案、订阅信息等，通常该请求是给管理员使用
+//
+//
+// Reference:
+// 	https://www.cnblogs.com/huxi2b/p/6223228.html
+//
 func (c *Consumer) rebalance() (map[string][]int32, error) {
-
 
 	memberID, _ := c.membership()
 	sarama.Logger.Printf("cluster/consumer %s rebalance\n", memberID)
-
 
 	// 获取所有可用 topics
 	allTopics, err := c.client.Topics()
@@ -704,6 +747,7 @@ func (c *Consumer) rebalance() (map[string][]int32, error) {
 	// 发送 joinGroup 请求到 coordinate broker
 	strategy, err := c.joinGroup()
 
+	// 出错返回
 	switch {
 	case err == sarama.ErrUnknownMemberId: // 如果 memberId 不能识别，就置空
 		c.membershipMu.Lock()
@@ -715,23 +759,30 @@ func (c *Consumer) rebalance() (map[string][]int32, error) {
 	}
 
 	// Sync consumer group state, fetch subscriptions
+	//
+	// 如果当前成员为 group leader，上面 joinGroup 会返回非 nil 的 strategy ，需要执行分配方案，并在 SyncGroup 请求中带回给 coordinator ；
+	// 如果当前成员非 group leader，也要发送 syncGroup 请求，只不过分配方案为空。
 	subs, err := c.syncGroup(strategy)
 	switch {
-	case err == sarama.ErrRebalanceInProgress:
+	case err == sarama.ErrRebalanceInProgress:	// 当前正在 rebalance 过程中，报错给客户端
 		return nil, err
 	case err != nil:
-		_ = c.leaveGroup()
+		_ = c.leaveGroup() // 其它错误，则离开 group
 		return nil, err
 	}
+
+	// syncGroup 之后，broker 会返回新的分配方案，即 subs 。
 	return subs, nil
 }
 
 // Performs the subscription, part of the mainLoop()
+//
+// 以 map[topic][partitions...] 并发创建 partitionConsumer
 func (c *Consumer) subscribe(tomb *loopTomb, subs map[string][]int32) error {
 
 	// fetch offsets
 	//
-	// fetch latest commit offsets as map[topic][partition]offset
+	// 去 Coordinator 查询当前 member 在 c.groupId 下订阅的 topic/partition 的最近提交 offset 信息
 	offsets, err := c.fetchOffsets(subs)
 	if err != nil {
 		_ = c.leaveGroup()
@@ -739,40 +790,38 @@ func (c *Consumer) subscribe(tomb *loopTomb, subs map[string][]int32) error {
 	}
 
 	// create consumers in parallel
+	//
+	// 以 sub[topic][partitions...] 并发创建 partitionConsumer
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-
 	for topic, partitions := range subs {
-
 		for _, partition := range partitions {
-
 			wg.Add(1)
-
+			// 获取 topic/partition 的偏移量信息
 			info := offsets[topic][partition]
-
 			go func(topic string, partition int32) {
-
-				// 实际上是创建的 partitionConsumer
+				// 创建的 partitionConsumer 负责从 offset 处消费 topic-partition 下数据
 				if e := c.createConsumer(tomb, topic, partition, info); e != nil {
 					mu.Lock()
 					err = e
 					mu.Unlock()
 				}
 				wg.Done()
-
 			}(topic, partition)
 
 		}
 	}
 
-
+	// 等待并发创建完成
 	wg.Wait()
 
+	// 如果任何一个 partitionConsumer 创建出错，则停止所有 partitionConsumer 并退出 Group 。
 	if err != nil {
 		_ = c.release()
 		_ = c.leaveGroup()
 	}
 
+	// 返回错误
 	return err
 }
 
@@ -806,12 +855,12 @@ func (c *Consumer) joinGroup() (*balancer, error) {
 		return nil, err
 	}
 
+	// 发送 joinGroup 请求给 coordinator broker
 	broker, err := c.client.Coordinator(c.groupID)
 	if err != nil {
 		c.closeCoordinator(broker, err)
 		return nil, err
 	}
-
 	resp, err := broker.JoinGroup(req)
 	if err != nil {
 		c.closeCoordinator(broker, err)
@@ -821,24 +870,22 @@ func (c *Consumer) joinGroup() (*balancer, error) {
 		return nil, resp.Err
 	}
 
-
 	var strategy *balancer
 
-	// 如果再均衡节点为当前节点
+	// 如果当前节点为 group leader 节点，coordinator 会把组成员及每个成员订阅的 topics 列表返回给它，
+	// leader 需要根据这些数据执行重新分配，并在后续 SyncGroup 请求中将分配方案返回给 coordinator ，
+	// coordinator 负责把分配方案通知组内所有成员。
 	if resp.LeaderId == resp.MemberId {
-
-		// 获取 members 信息时
+		// 获取 groupId 下所有 members，其中包含当前组的每个成员及其订阅的 topics 列表
 		members, err := resp.GetMembers()
 		if err != nil {
 			return nil, err
 		}
-
-		// 获取已删除topic A信息，newBalancerFromMeta 依据 member 中各 topic 信息获取 metaData .
+		// 根据 strategy 创建 balancer，执行 strategy.Perform 会完成订阅关系的重新分配
 		strategy, err = newBalancerFromMeta(c.client, Strategy(resp.GroupProtocol), members)
 		if err != nil {
 			return nil, err
 		}
-
 	}
 
 	c.membershipMu.Lock()
@@ -851,16 +898,22 @@ func (c *Consumer) joinGroup() (*balancer, error) {
 
 // Send a request to the broker to sync the group on rebalance().
 // Returns a list of topics and partitions to consume.
+//
+// 向 broker 发送 SyncGroup 请求，
+//
+//
 func (c *Consumer) syncGroup(strategy *balancer) (map[string][]int32, error) {
 
-
 	memberID, generationID := c.membership()
+
+	// 构造 syncGroup 请求
 	req := &sarama.SyncGroupRequest{
 		GroupId:      c.groupID,
 		MemberId:     memberID,
 		GenerationId: generationID,
 	}
 
+	// 如果 strategy 非空，则执行重新分配，把分配结果保存到 req 中发送给 coordinator ， coordinator 后续会广播给所有 members 。
 	if strategy != nil {
 		for memberID, topics := range strategy.Perform() {
 			if err := req.AddGroupAssignmentMember(memberID, &sarama.ConsumerGroupMemberAssignment{
@@ -871,14 +924,14 @@ func (c *Consumer) syncGroup(strategy *balancer) (map[string][]int32, error) {
 		}
 	}
 
-
+	// 获取 coordinator broker
 	broker, err := c.client.Coordinator(c.groupID)
 	if err != nil {
 		c.closeCoordinator(broker, err)
 		return nil, err
 	}
 
-
+	// 发送 joinGroup req 给 coordinator ，coordinator 收到请求后会返回属于当前 member 的分配方案
 	resp, err := broker.SyncGroup(req)
 	if err != nil {
 		c.closeCoordinator(broker, err)
@@ -890,6 +943,8 @@ func (c *Consumer) syncGroup(strategy *balancer) (map[string][]int32, error) {
 
 
 	// Return if there is nothing to subscribe to
+	//
+	// 如果没有要订阅的内容，直接返回
 	if len(resp.MemberAssignment) == 0 {
 		return nil, nil
 	}
@@ -904,17 +959,25 @@ func (c *Consumer) syncGroup(strategy *balancer) (map[string][]int32, error) {
 	for topic := range members.Topics {
 		sort.Sort(int32Slice(members.Topics[topic]))
 	}
+
+	// 返回需要订阅的 map[topic]patitionIds
 	return members.Topics, nil
 }
 
 // Fetches latest committed offsets for all subscriptions
+//
+//
 func (c *Consumer) fetchOffsets(subs map[string][]int32) (map[string]map[int32]offsetInfo, error) {
+
+
+	// 保存结果: map[topic][partition][offset]
 	offsets := make(map[string]map[int32]offsetInfo, len(subs))
+
+	// 构造请求
 	req := &sarama.OffsetFetchRequest{
 		Version:       1,
 		ConsumerGroup: c.groupID,
 	}
-
 	for topic, partitions := range subs {
 		offsets[topic] = make(map[int32]offsetInfo, len(partitions))
 		for _, partition := range partitions {
@@ -923,18 +986,19 @@ func (c *Consumer) fetchOffsets(subs map[string][]int32) (map[string]map[int32]o
 		}
 	}
 
+	// 发送 FetchOffset 请求给 Coordinator
 	broker, err := c.client.Coordinator(c.groupID)
 	if err != nil {
 		c.closeCoordinator(broker, err)
 		return nil, err
 	}
-
 	resp, err := broker.FetchOffset(req)
 	if err != nil {
 		c.closeCoordinator(broker, err)
 		return nil, err
 	}
 
+	// 解析响应
 	for topic, partitions := range subs {
 		for _, partition := range partitions {
 			block := resp.GetBlock(topic, partition)
@@ -949,6 +1013,8 @@ func (c *Consumer) fetchOffsets(subs map[string][]int32) (map[string]map[int32]o
 			}
 		}
 	}
+
+	// 返回结果
 	return offsets, nil
 }
 
@@ -994,7 +1060,7 @@ func (c *Consumer) createConsumer(tomb *loopTomb, topic string, partition int32,
 
 
 	// Store partitionConsumer in subscriptions
-	// 把 partitionConsumer 订阅信息登记在 c.subs 中
+	// 把 partitionConsumer 订阅信息登记在 closeCh.subs 中
 	c.subs.Store(topic, partition, pc)
 
 
@@ -1011,7 +1077,7 @@ func (c *Consumer) createConsumer(tomb *loopTomb, topic string, partition int32,
 	})
 
 
-	// 如果是独立消费模式，把 pc 推送到 c.partitions 管道中
+	// 如果是独立消费模式，把 pc 推送到 closeCh.partitions 管道中
 	if c.client.config.Group.Mode == ConsumerModePartitions {
 		select {
 		case c.partitions <- pc:
@@ -1048,7 +1114,6 @@ func (c *Consumer) closeCoordinator(broker *sarama.Broker, err error) {
 }
 
 
-
 // 获取哪些不在 coreTopics 但是在白名单里的 topics 列表
 func (c *Consumer) selectExtraTopics(allTopics []string) []string {
 	extra := allTopics[:0]
@@ -1061,13 +1126,13 @@ func (c *Consumer) selectExtraTopics(allTopics []string) []string {
 }
 
 
-// 检查 topic 是否存在于 c.coreTopics 中
+// 检查 topic 是否存在于 closeCh.coreTopics 中
 func (c *Consumer) isKnownCoreTopic(topic string) bool {
 	pos := sort.SearchStrings(c.coreTopics, topic)
 	return pos < len(c.coreTopics) && c.coreTopics[pos] == topic
 }
 
-// 检查 topic 是否存在于 c.extraTopics 中
+// 检查 topic 是否存在于 closeCh.extraTopics 中
 func (c *Consumer) isKnownExtraTopic(topic string) bool {
 	pos := sort.SearchStrings(c.extraTopics, topic)
 	return pos < len(c.extraTopics) && c.extraTopics[pos] == topic

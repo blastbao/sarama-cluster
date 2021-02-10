@@ -345,7 +345,7 @@ func (c *Consumer) Close() (err error) {
 
 		// 触发关闭，收到此信号后，所有后台协程均会退出
 		close(c.dying)
-		// 当 mainLoop 主协程最后退出时，会执行 close(closeCh.dead)，触发本处返回
+		// 当 mainLoop 主协程最后退出时，会执行 close(c.dead)，触发本处返回
 		<-c.dead
 
 		// 停止所有 consumers 并提交偏移量
@@ -396,8 +396,8 @@ func (c *Consumer) Close() (err error) {
 	return
 }
 
-// mainLoop 是个无限循环，仅能通过 Consumer.Close() 中 close(closeCh.dying) 来主动结束。
-// 在 mainLoop 退出前，会 close(closeCh.dead) 从而触发 Consumer.Close() 结束阻塞式等待并返回。
+// mainLoop 是个无限循环，仅能通过 Consumer.Close() 中 close(c.dying) 来主动结束。
+// 在 mainLoop 退出前，会 close(c.dead) 从而触发 Consumer.Close() 结束阻塞式等待并返回。
 func (c *Consumer) mainLoop() {
 
 	defer close(c.dead)
@@ -503,10 +503,8 @@ func (c *Consumer) nextTick() {
 	// 启动定时提交 Offset 协程
 	tomb.Go(c.cmLoop)
 
-
-	// 设置 closeCh.consuming 为 1 ，表明正在消费中
+	// 设置 c.consuming 为 1 ，表明正在消费中
 	atomic.StoreInt32(&c.consuming, 1)
-
 
 	// Wait for signals
 	//
@@ -622,7 +620,7 @@ func (c *Consumer) rebalanceError(err error, n *Notification) {
 	}
 }
 
-// 如果开启了通知，就把 n 写入 closeCh.notifications 管道中。
+// 如果开启了通知，就把 n 写入 c.notifications 管道中。
 func (c *Consumer) handleNotification(n *Notification) {
 	if c.client.config.Group.Return.Notifications {
 		select {
@@ -633,7 +631,7 @@ func (c *Consumer) handleNotification(n *Notification) {
 	}
 }
 
-// 如果开启了错误，就把 e 写入 closeCh.errors 管道中。
+// 如果开启了错误，就把 e 写入 c.errors 管道中。
 func (c *Consumer) handleError(e *Error) {
 	if c.client.config.Consumer.Return.Errors {
 		select {
@@ -1060,7 +1058,7 @@ func (c *Consumer) createConsumer(tomb *loopTomb, topic string, partition int32,
 
 
 	// Store partitionConsumer in subscriptions
-	// 把 partitionConsumer 订阅信息登记在 closeCh.subs 中
+	// 把 partitionConsumer 订阅信息登记在 c.subs 中
 	c.subs.Store(topic, partition, pc)
 
 
@@ -1077,7 +1075,7 @@ func (c *Consumer) createConsumer(tomb *loopTomb, topic string, partition int32,
 	})
 
 
-	// 如果是独立消费模式，把 pc 推送到 closeCh.partitions 管道中
+	// 如果是独立消费模式，把 pc 推送到 c.partitions 管道中
 	if c.client.config.Group.Mode == ConsumerModePartitions {
 		select {
 		case c.partitions <- pc:
@@ -1126,13 +1124,13 @@ func (c *Consumer) selectExtraTopics(allTopics []string) []string {
 }
 
 
-// 检查 topic 是否存在于 closeCh.coreTopics 中
+// 检查 topic 是否存在于 c.coreTopics 中
 func (c *Consumer) isKnownCoreTopic(topic string) bool {
 	pos := sort.SearchStrings(c.coreTopics, topic)
 	return pos < len(c.coreTopics) && c.coreTopics[pos] == topic
 }
 
-// 检查 topic 是否存在于 closeCh.extraTopics 中
+// 检查 topic 是否存在于 c.extraTopics 中
 func (c *Consumer) isKnownExtraTopic(topic string) bool {
 	pos := sort.SearchStrings(c.extraTopics, topic)
 	return pos < len(c.extraTopics) && c.extraTopics[pos] == topic

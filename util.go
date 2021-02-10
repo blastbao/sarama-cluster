@@ -53,14 +53,14 @@ func (p int32Slice) Diff(o int32Slice) (res []int32) {
 
 
 type loopTomb struct {
-	closeCh chan none		// 关闭管道
-	once    sync.Once		// 控制最多关闭一次
-	wg      sync.WaitGroup	// 当关闭时，等待所有协程全部退出
+	c    chan none      // 关闭管道
+	once sync.Once      // 控制最多关闭一次
+	wg   sync.WaitGroup // 当关闭时，等待所有协程全部退出
 }
 
 func newLoopTomb() *loopTomb {
 	return &loopTomb{
-		closeCh: make(chan none),
+		c: make(chan none),
 	}
 }
 
@@ -68,7 +68,7 @@ func newLoopTomb() *loopTomb {
 func (t *loopTomb) stop()  {
 	t.once.Do(
 		func() {
-			close(t.closeCh)
+			close(t.c)
 		},
 	)
 }
@@ -80,7 +80,7 @@ func (t *loopTomb) Close() {
 
 // 返回监听管道，如果有协程退出，或者有主动的 Close 操作，该管道会被触发。
 func (t *loopTomb) Dying() <-chan none {
-	return t.closeCh
+	return t.c
 }
 
 // 每 t.Go 一次，会创建一个后台协程，任何一个后台协程退出，都会触发 t.stop() ，会使所有后台协程均退出。
@@ -89,7 +89,7 @@ func (t *loopTomb) Go(f func(<-chan none)) {
 	go func() {
 		defer t.stop()
 		defer t.wg.Done()
-		// 执行 f ，并把 t.closeCh 传递给它，用于触发其退出
-		f(t.closeCh)
+		// 执行 f ，并把 t.c 传递给它，用于触发其退出
+		f(t.c)
 	}()
 }

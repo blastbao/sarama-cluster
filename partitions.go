@@ -127,20 +127,20 @@ func (c *partitionConsumer) Close() error {
 
 func (c *partitionConsumer) waitFor(stopper <-chan none) {
 
-	// 等待 stopper 和 closeCh.dying 上的关闭信号
+	// 等待 stopper 和 c.dying 上的关闭信号
 	select {
 	case <-stopper:
 	case <-c.dying:
 	}
-	// 关闭 closeCh.dead，触发 closeCh.Close() 的返回
+	// 关闭 c.dead，触发 c.Close() 的返回
 	close(c.dead)
 }
 
 
-// 多路复用: 把 closeCh.Messages() 转发到 messages，把 closeCh.Errors() 转发到 errors 。
+// 多路复用: 把 c.Messages() 转发到 messages，把 c.Errors() 转发到 errors 。
 func (c *partitionConsumer) multiplex(stopper <-chan none, messages chan<- *sarama.ConsumerMessage, errors chan<- error) {
 
-	// 关闭 closeCh.dead，触发 closeCh.Close() 的返回
+	// 关闭 c.dead，触发 c.Close() 的返回
 	defer close(c.dead)
 
 	for {

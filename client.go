@@ -15,7 +15,7 @@ var errClientInUse = errors.New("cluster: client is already used by another cons
 //
 // Client 是消费组客户端
 type Client struct {
-	// 匿名包含
+	// 匿名包含 `sarama.Client`，用于拉取元数据
 	sarama.Client
 
 	// 消费组配置

@@ -78,6 +78,7 @@ func (n *Notification) success(current map[string][]int32) *Notification {
 	return o
 }
 
+// 拷贝
 func (n *Notification) error() *Notification {
 
 	o := &Notification{

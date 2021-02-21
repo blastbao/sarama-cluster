@@ -11,10 +11,10 @@ import (
 
 // Consumer is a cluster group consumer
 type Consumer struct {
-	client    *Client
-	ownClient bool
+	client    *Client			// 消费组客户端
+	ownClient bool				//
 
-	consumer sarama.Consumer
+	consumer sarama.Consumer	//
 	subs     *partitionMap
 
 	consumerID string			// 没用到
@@ -49,7 +49,7 @@ func NewConsumer(addrs []string, groupID string, topics []string, config *Config
 		return nil, err
 	}
 
-	//
+	// 创建消费组
 	consumer, err := NewConsumerFromClient(client, groupID, topics)
 	if err != nil {
 		return nil, err
@@ -72,7 +72,6 @@ func NewConsumer(addrs []string, groupID string, topics []string, config *Config
 // 各 partitionConsumer 按 leader-broker 创建 brokerConsumer ，brokerConsumer 周期性发起 fetch 请求，消费数据。
 //
 func NewConsumerFromClient(client *Client, groupID string, topics []string) (*Consumer, error) {
-
 
 	// 检查 client 是否 `正在使用中`
 	if !client.claim() {
@@ -409,6 +408,7 @@ func (c *Consumer) mainLoop() {
 		atomic.StoreInt32(&c.consuming, 0)
 
 		// Check if close was requested
+		// 每次 for 循环开始前检查是否已关闭
 		select {
 		case <-c.dying:
 			return
@@ -442,7 +442,7 @@ func (c *Consumer) nextTick() {
 
 	// Release subscriptions
 	//
-	// 停止所有 consumers 并提交偏移量
+	// 停止所有 partitionConsumers 并提交偏移量
 	if err := c.release(); err != nil {
 		c.rebalanceError(err, nil)
 		return
@@ -474,10 +474,9 @@ func (c *Consumer) nextTick() {
 	// 启动心跳协程
 	tomb.Go(c.hbLoop)
 
-
 	// Subscribe to topic/partitions
 	//
-	// 用最新分配的订阅类别，创建对应的一组 PartitionConsumers ，并启动消费
+	// 用最新分配的订阅关系，创建对应的一组 PartitionConsumers ，并启动消费
 	if err := c.subscribe(tomb, subs); err != nil {
 		c.rebalanceError(err, notification)
 		return
@@ -491,7 +490,6 @@ func (c *Consumer) nextTick() {
 		notification = notification.success(subs)
 		c.handleNotification(notification)
 	}
-
 
 	// Start topic watcher loop
 	//
@@ -599,21 +597,21 @@ func (c *Consumer) cmLoop(stopped <-chan none) {
 }
 
 
-//
 func (c *Consumer) rebalanceError(err error, n *Notification) {
 
 	if n != nil {
 		// Get a copy of the notification that represents the notification's error state
-		n = n.error()
-		c.handleNotification(n)
+		n = n.error()			// 拷贝生成一个新的 Notification 对象
+		c.handleNotification(n) // 如果开启了通知，就把新 Notification 对象写入 c.notifications 管道中，通知用户
 	}
 
 	switch err {
-	case sarama.ErrRebalanceInProgress:
+	case sarama.ErrRebalanceInProgress:						// 如果 rebalance 正在进行中，无需报错给用户
 	default:
-		c.handleError(&Error{Ctx: "rebalance", error: err})
+		c.handleError(&Error{Ctx: "rebalance", error: err}) // 如果开启了错误，就把 e 写入 c.errors 管道中，通知用户
 	}
 
+	// 等待一段时间
 	select {
 	case <-c.dying:
 	case <-time.After(c.client.config.Metadata.Retry.Backoff):
@@ -797,8 +795,8 @@ func (c *Consumer) subscribe(tomb *loopTomb, subs map[string][]int32) error {
 			wg.Add(1)
 			// 获取 topic/partition 的偏移量信息
 			info := offsets[topic][partition]
+			// 启动协程，创建 partitionConsumer 负责从 offset 处消费 topic-partition 下数据，创建完成后协程退出(非阻塞)。
 			go func(topic string, partition int32) {
-				// 创建的 partitionConsumer 负责从 offset 处消费 topic-partition 下数据
 				if e := c.createConsumer(tomb, topic, partition, info); e != nil {
 					mu.Lock()
 					err = e
@@ -1045,9 +1043,9 @@ func (c *Consumer) leaveGroup() error {
 
 func (c *Consumer) createConsumer(tomb *loopTomb, topic string, partition int32, info offsetInfo) error {
 
+	// 获取当前实例在消费组内的成员 ID
 	memberID, _ := c.membership()
 	sarama.Logger.Printf("cluster/consumer %s consume %s/%d from %d\n", memberID, topic, partition, info.NextOffset(c.client.config.Consumer.Offsets.Initial))
-
 
 	// Create partitionConsumer
 	// 创建 partitionConsumer 来消费 topic-partition 上数据
@@ -1056,11 +1054,9 @@ func (c *Consumer) createConsumer(tomb *loopTomb, topic string, partition int32,
 		return err
 	}
 
-
 	// Store partitionConsumer in subscriptions
 	// 把 partitionConsumer 订阅信息登记在 c.subs 中
 	c.subs.Store(topic, partition, pc)
-
 
 	// Start partition consumer goroutine
 	// 启动后台协程
@@ -1153,7 +1149,6 @@ func (c *Consumer) isPotentialExtraTopic(topic string) bool {
 
 	return false
 }
-
 
 
 func (c *Consumer) refreshCoordinator() error {
